@@ -294,6 +294,36 @@ Claude Code IDE includes intelligent flicker reduction for vterm terminals to pr
 
 This optimization detects rapid terminal redraw sequences (like when Claude expands text areas) and batches them for smoother rendering. The 5ms default delay provides optimal visual quality with imperceptible latency.
 
+**** vterm Native Prompt Tracking
+
+To ensure the most reliable terminal interaction (especially for =C-c '= and allowing Claude to see what you are currently typing), it is highly recommended to enable **vterm's native prompt tracking**.
+
+1. In your Emacs configuration:
+   #+begin_src emacs-lisp
+   (setq vterm-use-vterm-prompt-detection-method t)
+   #+end_src
+
+2. In your shell configuration (e.g., =~/.bashrc= or =~/.zshrc=), add the required escape sequence.
+
+   For **Bash**:
+   #+begin_src bash
+   vterm_prompt_end(){
+       printf "\e]51;A$(whoami)@$(hostname):$(pwd)\e\\"
+   }
+   PS1=$PS1'\[$(vterm_prompt_end)\]'
+   #+end_src
+
+   For **Zsh**:
+   #+begin_src bash
+   vterm_prompt_end() {
+       vterm_printf "51;A$(whoami)@$(hostname):$(pwd)"
+   }
+   setopt PROMPT_SUBST
+   PROMPT=$PROMPT'%{$(vterm_prompt_end)%}'
+   #+end_src
+
+Refer to the [[https://github.com/akermu/emacs-libvterm#shell-configuration][vterm documentation]] for more details on shell configuration.
+
 **** Terminal Initialization Delay
 
 Claude Code IDE includes a brief initialization delay when launching terminals to ensure proper layout rendering:

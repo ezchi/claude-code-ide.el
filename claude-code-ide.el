@@ -4,7 +4,7 @@
 
 ;; Author: Yoav Orot
 ;; Version: 0.2.7
-;; Package-Requires: ((emacs "28.1") (websocket "1.12") (transient "0.9.0") (web-server "0.1.2"))
+;; Package-Requires: ((emacs "28.1") (websocket "1.12") (transient "0.9.0") (web-server "0.1.2") (with-editor "3.4.0"))
 ;; Keywords: ai, claude, code, assistant, mcp, websocket
 ;; URL: https://github.com/manzaltu/claude-code-ide.el
 
@@ -67,6 +67,15 @@
 (require 'claude-code-ide-emacs-tools)
 
 ;; External variable declarations
+(defvar with-editor-show-usage)
+(defvar with-editor-finish-query-functions)
+
+;; External function declarations for with-editor
+(declare-function with-editor-mode "with-editor" (&optional arg))
+(declare-function with-editor-finish "with-editor" ())
+(declare-function with-editor-cancel "with-editor" ())
+
+;; External variable declarations
 (defvar eat-terminal)
 (defvar eat--synchronize-scroll-function)
 (defvar vterm-shell)
@@ -84,11 +93,14 @@
 (declare-function vterm-send-string "vterm" (string))
 (declare-function vterm-send-escape "vterm" ())
 (declare-function vterm-send-return "vterm" ())
+(declare-function vterm-reset-cursor-point "vterm" ())
+(declare-function vterm--get-prompt-point "vterm" ())
 (declare-function vterm--window-adjust-process-window-size "vterm" (&optional frame))
 
 ;; External function declarations for eat
 (declare-function eat-mode "eat" ())
 (declare-function eat-exec "eat" (buffer name command startfile &rest switches))
+(declare-function eat-term-end "eat" (terminal))
 (declare-function eat-term-send-string "eat" (terminal string))
 (declare-function eat-term-display-cursor "eat" (terminal))
 (declare-function eat--adjust-process-window-size "eat" (process windows))
@@ -430,6 +442,15 @@ INPUT contains the terminal output stream."
 (defvar-local claude-code-ide--saved-cursor-type nil
   "Saved cursor-type before entering vterm-copy-mode.")
 
+(defvar-local claude-code-ide--session-buffer nil
+  "The Claude Code session buffer associated with this prompt buffer.")
+
+(defvar-local claude-code-ide--saved-window-configuration nil
+  "Window configuration to restore when closing a prompt buffer.")
+
+(defvar-local claude-code-ide--at-mention-files-cache nil
+  "Cached relative file list for @ mention completion in the prompt buffer.")
+
 (defun claude-code-ide--vterm-copy-mode-hook ()
   "Make sure cursor is visible in `vterm-copy-mode'.
 Saves the current cursor-type when entering copy mode and restores it
@@ -584,20 +605,24 @@ from the window where it was initially created."
   "Set up keybindings for the Claude Code terminal buffer.
 This function binds:
 - M-RET (Alt-Return) to insert a newline
-- C-<escape> to send escape"
+- C-<escape> to send escape
+- C-c ' to open the prompt buffer"
   (cond
    ((eq claude-code-ide-terminal-backend 'vterm)
     ;; For vterm, we set up local keybindings in vterm-mode-map
     (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
-    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape))
+    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape)
+    (local-set-key (kbd "C-c '") #'claude-code-ide-edit-prompt))
    ((eq claude-code-ide-terminal-backend 'eat)
     ;; For eat, we need to modify the semi-char mode map which is the default
     ;; We use local-set-key to make it buffer-local
     (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
-    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape))
+    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape)
+    (local-set-key (kbd "C-c '") #'claude-code-ide-edit-prompt))
    ((eq claude-code-ide-terminal-backend 'ghostel)
     (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
-    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape))
+    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape)
+    (local-set-key (kbd "C-c '") #'claude-code-ide-edit-prompt))
    (t
     (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))))
 
@@ -1306,22 +1331,248 @@ Use this to balance between visual smoothness and raw responsiveness."
              "disabled (direct rendering, maximum responsiveness)")))
 
 ;;;###autoload
-(defun claude-code-ide-send-prompt (&optional prompt)
+(defun claude-code-ide-send-prompt (&optional prompt no-return clear-line)
   "Send a prompt to the Claude Code terminal.
 When called interactively, reads a prompt from the minibuffer.
-When called programmatically, sends the given PROMPT string."
+When called programmatically, sends the given PROMPT string.
+If NO-RETURN is non-nil, do not send the return key.
+If CLEAR-LINE is non-nil, send C-u to clear the current line first."
   (interactive)
   (let ((buffer-name (claude-code-ide--get-buffer-name)))
     (if-let ((buffer (get-buffer buffer-name)))
         (let ((prompt-to-send (or prompt (read-string "Claude prompt: "))))
-          (when (not (string-empty-p prompt-to-send))
+          (when (or clear-line (not (string-empty-p prompt-to-send)))
             (with-current-buffer buffer
-              (claude-code-ide--terminal-send-string prompt-to-send)
-              ;; Small delay to ensure prompt text is processed before sending return
-              (sit-for 0.1)
-              (claude-code-ide--terminal-send-return))
+              (when clear-line
+                (if (eq claude-code-ide-terminal-backend 'vterm)
+                    (vterm-send-key "u" nil nil t) ; C-u
+                  (claude-code-ide--terminal-send-string "\C-u"))
+                ;; Give the terminal a moment to process the clear command
+                (sit-for 0.1))
+              (unless (string-empty-p prompt-to-send)
+                (claude-code-ide--terminal-send-string prompt-to-send))
+              (unless no-return
+                ;; Small delay to ensure prompt text is processed before sending return
+                (sit-for 0.1)
+                (claude-code-ide--terminal-send-return)))
             (claude-code-ide-debug "Sent prompt to Claude Code: %s" prompt-to-send)))
       (user-error "No Claude Code session for this project"))))
+
+;;;###autoload
+(defun claude-code-ide-edit-prompt ()
+  "Edit the Claude Code terminal prompt in a buffer.
+The buffer is in `text-mode` and `with-editor-mode` (if available).
+The buffer is initialized with the active region (if any) or the current terminal input.
+Press C-c C-c to update the terminal prompt (without sending) or C-c C-k to cancel."
+  (interactive)
+  (let* ((working-dir (claude-code-ide--get-working-directory))
+         (buffer-name (claude-code-ide--get-buffer-name))
+         (target-buffer (get-buffer buffer-name))
+         (window-config (current-window-configuration))
+         (region-text (when (use-region-p)
+                        (buffer-substring-no-properties (region-beginning) (region-end)))))
+    (unless target-buffer
+      (user-error "No Claude Code session for this project"))
+    (let ((prompt-buffer (get-buffer-create (format "*Claude Prompt [%s]*"
+                                                    (file-name-nondirectory (directory-file-name working-dir)))))
+          (initial-input (or region-text
+                             (claude-code-ide--get-terminal-input target-buffer))))
+      (with-current-buffer prompt-buffer
+        (text-mode)
+        (setq-local default-directory working-dir)
+        (setq-local claude-code-ide--session-buffer target-buffer)
+        (setq-local claude-code-ide--saved-window-configuration window-config)
+        (setq-local completion-styles '(flex partial-completion basic))
+        (setq-local completion-category-defaults nil)
+        (setq-local completion-category-overrides '((file (styles flex partial-completion basic))))
+        (setq-local tab-always-indent 'complete)
+        (add-hook 'completion-at-point-functions #'claude-code-ide--at-mentioned-completion-at-point nil t)
+        (add-hook 'post-self-insert-hook #'claude-code-ide--prompt-buffer-post-self-insert nil t)
+        (erase-buffer)
+        (when (and initial-input (not (string-empty-p initial-input)))
+          (insert (string-trim initial-input)))
+        ;; Use an explicit local keymap so C-c C-c always applies the prompt
+        ;; instead of invoking editor/file-saving workflows.
+        (use-local-map (copy-keymap text-mode-map))
+        (local-set-key (kbd "C-c C-c") #'claude-code-ide--apply-prompt-buffer)
+        (local-set-key (kbd "C-c C-k") #'claude-code-ide--cancel-prompt-buffer)
+        (message "Type your prompt and press C-c C-c to update, or C-c C-k to cancel."))
+      (pop-to-buffer prompt-buffer))))
+
+(defun claude-code-ide--apply-prompt-buffer ()
+  "Apply current prompt buffer content to the Claude terminal and clean up."
+  (interactive)
+  (let ((prompt-buffer (current-buffer))
+        (prompt (buffer-substring-no-properties (point-min) (point-max)))
+        (target-buffer claude-code-ide--session-buffer)
+        (window-config claude-code-ide--saved-window-configuration))
+    (set-buffer-modified-p nil)
+    (when window-config
+      (set-window-configuration window-config))
+    (when (buffer-live-p prompt-buffer)
+      (kill-buffer prompt-buffer))
+    (when (and target-buffer (buffer-live-p target-buffer))
+      ;; Send with no-return=t and clear-line=t to overwrite the existing prompt
+      (claude-code-ide-send-prompt (string-trim prompt) t t))))
+
+(defun claude-code-ide--get-terminal-input (buffer)
+  "Try to get the current input line from the Claude terminal in BUFFER."
+  (when (and buffer (buffer-live-p buffer))
+    (with-current-buffer buffer
+      (when-let ((input
+                  (or (claude-code-ide--get-terminal-input-from-vterm)
+                      (claude-code-ide--get-terminal-input-from-eat)
+                      (claude-code-ide--get-terminal-input-from-text))))
+        (claude-code-ide--strip-terminal-prompt-prefix
+         (claude-code-ide--strip-terminal-ui-suffix input))))))
+
+(defun claude-code-ide--strip-terminal-ui-suffix (input)
+  "Strip Claude Code terminal footer/status text from INPUT.
+The Claude Code CLI renders status hints like
+\"{accept edits on (shift+tab to cycle)}\" below the prompt area.
+These appear on their own line enclosed in curly braces.
+Also handles blocky separators and other common TUI artifacts."
+  (let ((result (if (string-match "\n[▄▀━─_-╰╯╭╮│┃ ]\\{10,\\}\\(?:.\\|\n\\)*\\'" input)
+                    (substring input 0 (match-beginning 0))
+                  input)))
+    ;; Also handle case where there's a lot of whitespace and then a TUI-like footer
+    (setq result (if (string-match "\n\n+[[:space:]\u00a0]*\\(?:\\? for shortcuts\\|workspace (.*)\\)\\'" result)
+                     (substring result 0 (match-beginning 0))
+                   result))
+    ;; Original Claude footer strip
+    (setq result (replace-regexp-in-string
+                  "[\n\r][[:space:]]*{[^}\n]*}[[:space:]]*\\'" "" result))
+    (string-trim-right result)))
+
+(defun claude-code-ide--strip-terminal-prompt-prefix (input)
+  "Strip a visible Claude prompt prefix from INPUT."
+  (let ((stripped (string-trim-left input "[[:space:]\u00a0]+")))
+    (cond
+     ((string-match "\\`[│┃[:space:]\u00a0]*\\(?:claude[[:space:]\u00a0]+\\)?>[[:space:]\u00a0]+" stripped)
+      (substring stripped (match-end 0)))
+     ;; Strip decorative shell prompts like \"❯ \" or \"$ \" when they are
+     ;; a short symbol-only token followed by whitespace.
+     ((string-match "\\`[[:space:]\u00a0]*[^[:alnum:]_[:space:]\u00a0]\\{1,3\\}[[:space:]\u00a0]+" stripped)
+      (substring stripped (match-end 0)))
+     (t stripped))))
+
+(defun claude-code-ide--get-terminal-input-from-vterm ()
+  "Read the active command buffer contents from the current vterm buffer.
+Prioritizes native vterm prompt tracking if enabled and configured."
+  (when (derived-mode-p 'vterm-mode)
+    (save-excursion
+      (when (fboundp 'vterm-reset-cursor-point)
+        (vterm-reset-cursor-point))
+      (let* ((cursor (point))
+             (prompt-start (when (fboundp 'vterm--get-prompt-point)
+                             (vterm--get-prompt-point)))
+             (use-native (and (boundp 'vterm-use-vterm-prompt-detection-method)
+                              vterm-use-vterm-prompt-detection-method
+                              prompt-start
+                              (<= prompt-start cursor))))
+        (if use-native
+            (buffer-substring-no-properties prompt-start cursor)
+          ;; Fallback to text-based search for unconfigured shells
+          (goto-char cursor)
+          (if (re-search-backward "\\(?:claude \\)?> " (max (point-min) (- cursor 500)) t)
+              (buffer-substring-no-properties (match-end 0) cursor)
+            ;; Last resort fallback to tracked prompt point even if not \"native\"
+            (when (and (integer-or-marker-p prompt-start)
+                       (<= prompt-start cursor))
+              (buffer-substring-no-properties prompt-start cursor))))))))
+
+(defun claude-code-ide--get-terminal-input-from-eat ()
+  "Read the active command buffer contents from the current Eat buffer."
+  (when (and (derived-mode-p 'eat-mode)
+             (boundp 'eat-terminal)
+             eat-terminal
+             (fboundp 'eat-term-display-cursor))
+    (let ((input-end (eat-term-display-cursor eat-terminal))
+          (input-start (when (fboundp 'eat-term-end)
+                         (eat-term-end eat-terminal))))
+      (save-excursion
+        (goto-char input-end)
+        (if (re-search-backward "\\(?:claude \\)?> " (max (point-min) (- input-end 500)) t)
+            (buffer-substring-no-properties (match-end 0) input-end)
+          ;; Fallback to eat's tracked terminal end
+          (when (and (integer-or-marker-p input-start)
+                     (<= input-start input-end))
+            (buffer-substring-no-properties input-start input-end)))))))
+
+(defun claude-code-ide--get-terminal-input-from-text ()
+  "Fallback text-based extraction for terminal buffers without prompt metadata."
+  (save-excursion
+    ;; Start from current point (which is at the cursor for vterm/eat)
+    ;; instead of point-max to avoid grabbing TUI footers.
+    (let ((end (point)))
+      (if (re-search-backward "\\(?:claude \\)?> " (max (point-min) (- end 1000)) t)
+          (buffer-substring-no-properties (match-end 0) end)
+        ;; Fallback to just the current line
+        (forward-line 0)
+        (buffer-substring-no-properties (point) end)))))
+
+(defun claude-code-ide--cancel-prompt-buffer ()
+  "Cancel the prompt and kill the buffer."
+  (interactive)
+  (let ((prompt-buffer (current-buffer))
+        (window-config claude-code-ide--saved-window-configuration))
+    (set-buffer-modified-p nil)
+    (when window-config
+      (set-window-configuration window-config))
+    (when (buffer-live-p prompt-buffer)
+      (kill-buffer prompt-buffer))))
+
+(defun claude-code-ide--at-mentioned-bounds ()
+  "Return bounds of the @ mention at point as (START . END)."
+  (let* ((pos (point))
+         (start (save-excursion
+                  (skip-chars-backward "^ \t\n\r")
+                  (point))))
+    (when (and (< start pos)
+               (char-equal (char-after start) ?@))
+      (cons (1+ start) pos))))
+
+(defun claude-code-ide--at-mention-candidates ()
+  "Return cached relative file paths for @ mention completion."
+  (or claude-code-ide--at-mention-files-cache
+      (setq claude-code-ide--at-mention-files-cache
+            (let* ((working-dir default-directory)
+                   (project (project-current nil working-dir))
+                   (files (if project
+                              (project-files project)
+                            (directory-files-recursively working-dir ".*" nil))))
+              (mapcar (lambda (f) (file-relative-name f working-dir)) files)))))
+
+(defun claude-code-ide--filesystem-path-mention-p (input)
+  "Return non-nil when INPUT should use filesystem path completion."
+  (or (string-prefix-p "~" input)
+      (file-name-absolute-p input)
+      (string-prefix-p "./" input)
+      (string-prefix-p "../" input)))
+
+(defun claude-code-ide--at-mention-completion-table (string pred action)
+  "Completion table for @ mentions using STRING, PRED, and ACTION."
+  (if (claude-code-ide--filesystem-path-mention-p string)
+      (completion-file-name-table string pred action)
+    (complete-with-action action (claude-code-ide--at-mention-candidates) string pred)))
+
+(defun claude-code-ide--at-mentioned-completion-at-point ()
+  "Completion at point for '@' mentions in the prompt buffer."
+  (when-let ((bounds (claude-code-ide--at-mentioned-bounds)))
+    (list (car bounds) (cdr bounds) #'claude-code-ide--at-mention-completion-table
+          :exclusive 'no
+          :annotation-function (lambda (_) " [File]")
+          :category 'file)))
+
+(defun claude-code-ide--prompt-buffer-post-self-insert ()
+  "Trigger fuzzy @ mention completion after typing in the prompt buffer."
+  (when (and (not (minibufferp))
+             (memq this-command '(self-insert-command org-self-insert-command))
+             (claude-code-ide--at-mentioned-bounds)
+             (let ((char last-command-event))
+               (and (characterp char)
+                    (not (memq char '(?\s ?\t ?\n ?\r))))))
+    (completion-at-point)))
 
 ;;;###autoload
 (defun claude-code-ide-toggle ()
